@@ -1,0 +1,52 @@
+# ------------------------
+# Multistep Conformal Prediction
+# ------------------------
+
+# System Generated Results & Figures
+results/
+ALPaCA/results/
+DtACI/results/
+**/results/
+Figures/
+DtACI/Figures/
+**/Figures/
+summaries/
+ALPaCA/summaries/
+
+# Standard Python exclusions
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Deep Learning specific
+*.pt
+*.pth
+*.ckpt
+logs/
+*.log
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
