@@ -228,7 +228,7 @@ class DtACISigmaPool:
 #  Σ OPTIMIZATION:  min  det(Σ) + x · ‖Σ − Σ_T‖_F,   Σ ≻ 0
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min_eig_frac=0.3):
+def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min_eig_frac=0.3, prob_method="empirical", prob_weight=10.0):
     """
     Find Σ* that minimizes  |pr(eΣ^{-1}e < 1) - (1 -\alpha)| +  det(Σ) + λ · ‖Σ − Σ_T‖_F
     subject to Σ being symmetric positive-definite.
@@ -245,6 +245,7 @@ def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min
         recent_residuals: (n, d) matrix of recent error offsets
         max_iter:         optimizer iterations
         min_eig_frac:     fraction of min eigenvalue of Σ_T for L's diagonal floor
+        prob_method:      "empirical", "moment", "davies", "none"
 
     Returns:
         sigma_opt: (d, d) optimized PSD matrix
@@ -299,13 +300,70 @@ def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min
         det_val = np.linalg.det(Sigma)
         frob = np.linalg.norm(Sigma - sigma_T, 'fro')
         
-        # New empirical coverage penalty: |pr(eΣ^{-1}e < 1) - (1 - α)|
-        if len(recent_residuals) > 0:
+        # Evaluate coverage probability penalty
+        if prob_method == "none":
+            coverage_penalty = 0.0
+        elif len(recent_residuals) > 0:
             inv_Sigma = np.linalg.pinv(Sigma)
-            # Differentiable sigmoid approximation of indicator function (1 if < 1)
-            mahal_dists = np.einsum('ij,jk,ik->i', recent_residuals, inv_Sigma, recent_residuals)
-            pr = np.mean(1.0 / (1.0 + np.exp(-10.0 * (1.0 - mahal_dists))))
-            coverage_penalty = np.abs(pr - (1.0 - alpha_t))
+            
+            if prob_method == "empirical":
+                # Differentiable sigmoid approximation
+                mahal_dists = np.einsum('ij,jk,ik->i', recent_residuals, inv_Sigma, recent_residuals)
+                pr = np.mean(1.0 / (1.0 + np.exp(-10.0 * (1.0 - mahal_dists))))
+                
+            # This is the best option as of now for real-time online CP
+            elif prob_method == "moment":
+                # Welch-Satterthwaite / Pearson moment matching
+                Sigma_e = np.cov(recent_residuals, rowvar=False) if len(recent_residuals) > 1 else np.eye(d)
+                mu_e = np.mean(recent_residuals, axis=0)
+                A = inv_Sigma
+                mu_e = np.zeros(d) # Force zero-mean: coverage is relative to ALPaCA prediction center
+                AS = A @ Sigma_e
+                E_Q = np.trace(AS) + mu_e.T @ A @ mu_e
+                Var_Q = 2 * np.trace(AS @ AS) + 4 * mu_e.T @ A @ Sigma_e @ A @ mu_e
+                import scipy.stats
+                if E_Q > 1e-6 and Var_Q > 1e-6:
+                    pr = scipy.stats.gamma.cdf(1.0, a=(E_Q**2)/Var_Q, scale=Var_Q/E_Q)
+                else:
+                    pr = 0.0
+                    
+            elif prob_method == "davies":
+                # Exact Gil-Pelaez CF Numerical Integration
+                Sigma_e = np.cov(recent_residuals, rowvar=False) if len(recent_residuals) > 1 else np.eye(d)
+                mu_e = np.zeros(d) # Force zero-mean: coverage is relative to ALPaCA prediction center
+                A = inv_Sigma
+                try:
+                    L_e = np.linalg.cholesky(Sigma_e)
+                except np.linalg.LinAlgError:
+                    L_e = np.linalg.cholesky(Sigma_e + 1e-6 * np.eye(d))
+                
+                A_scaled = L_e.T @ A @ L_e
+                lambdas, V = np.linalg.eigh(A_scaled)
+                b_vec = V.T @ L_e.T @ A @ mu_e
+                c_val = mu_e.T @ A @ mu_e
+                
+                def cf_vec(t):
+                    res = np.exp(1j * t * c_val)
+                    for j in range(len(lambdas)):
+                        lj = lambdas[j]
+                        if abs(lj) < 1e-10:
+                            res *= np.exp(2j * t * b_vec[j])
+                        else:
+                            dj = b_vec[j] / lj
+                            term1 = (1 - 2j * t * lj)**(-0.5)
+                            term2 = np.exp((1j * t * lj * dj**2) / (1 - 2j * t * lj))
+                            term3 = np.exp(-1j * t * lj * dj**2)
+                            res *= term1 * term2 * term3
+                    return res
+                
+                t_vals = np.linspace(1e-5, 20.0, 150)
+                y_vals = np.imag(cf_vec(t_vals) * np.exp(-1j * t_vals * 1.0)) / t_vals
+                integral = np.trapz(y_vals, t_vals)
+                
+                pr = np.clip(0.5 - (1.0 / np.pi) * integral, 0.0, 1.0)
+                
+            det_T = np.linalg.det(sigma_T)
+            coverage_penalty = prob_weight * det_T * abs(pr - (1.0 - alpha_t))
         else:
             coverage_penalty = 0.0
 
@@ -423,40 +481,46 @@ class IntegratedAlpacaDtACI:
       6. Feed updated α_t back to ALPaCA
     """
 
-    def __init__(self, d, alpha_target=0.1, gammas=None,
-                 n_context=10, lam=1.0, sigma_mix=1/1000, eta=2.72,
-                 alpha_gamma=0.01, scale_gamma=0.01, scale_init=1.0,
-                 warmup=50, alpaca_train_iters=500,
-                 alpaca_kwargs=None):
+    def __init__(self,
+                 d,
+                 alpha_target=0.1,
+                 n_context=10,
+                 lam=0.5,
+                 alpha_gamma=0.01,
+                 scale_gamma=0.01,
+                 warmup=50,
+                 alpaca_train_iters=100,
+                 alpaca_kwargs=None,
+                 replay_buffer_size=0,
+                 prob_method="empirical",
+                 prob_weight=10.0):
         """
-        Args:
-            d:             dimensionality of error vectors
-            alpha_target:  target miscoverage rate (e.g. 0.1 → 90% coverage)
-            gammas:        candidate learning rates for sigma expert pool
-            n_context:     context window for ALPaCA
-            lam:           regularization weight x in det(Σ) + x·‖Σ−Σ_T‖²
-            sigma_mix:     mixing parameter for expert stability
-            eta:           learning rate for expert weighting
-            alpha_gamma:   fixed learning rate for α_t scalar update
-            scale_gamma:   fixed learning rate for s_t scalar update
-            scale_init:    initial scale factor
-            warmup:        warm-up period
-            alpaca_train_iters: training iterations for ALPaCA
-            alpaca_kwargs: extra kwargs for ALPaCA config
+        d: dimensionality of the time series
+        alpha_target: target expected error rate (e.g., 0.1 for 90% coverage)
+        n_context: number of historical points ALPaCA uses to predict mu
+        lam: regularization weight for optimize_sigma (λ · ||Σ - Σ_T||)
+        alpha_gamma: step size for adjusting α_t
+        scale_gamma: step size for adjusting s_t
+        warmup: steps to skip tracking metrics to allow buffers to fill
+        alpaca_train_iters: epochs for offline meta-learning loop
+        alpaca_kwargs: dict for ALPaCA init (layers, eps)
+        replay_buffer_size: steps to replay dynamically to ghost calibrate DtACI threshold tracking
+        prob_method: "empirical", "moment", "davies", or "none"
         """
         self.d = d
         self.alpha_target = alpha_target
         self.n_context = n_context
         self.lam = lam
+        self.alpha_gamma = alpha_gamma
+        self.scale_gamma = scale_gamma
         self.warmup = warmup
         self.alpaca_train_iters = alpaca_train_iters
         self.alpaca_kwargs = alpaca_kwargs or {}
-        self.alpha_gamma = alpha_gamma
-        self.scale_gamma = scale_gamma
+        self.replay_buffer_size = replay_buffer_size
+        self.prob_method = prob_method
+        self.prob_weight = prob_weight
 
-        if gammas is None:
-            gammas = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
-        self.gammas = gammas
+        self.gammas = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
 
         # --- DtACI Controllers ---
 
@@ -466,14 +530,14 @@ class IntegratedAlpacaDtACI:
 
         # 2) Σ_T controller: DtACI expert pool (the core DtACI component)
         self.sigma_ctrl = DtACISigmaPool(
-            gammas=gammas, d=d, sigma_init=None,
-            sigma_mix=sigma_mix, eta=eta
+            gammas=self.gammas, d=d, sigma_init=None,
+            sigma_mix=1/1000, eta=2.72
         )
 
         # 3) s_t: simple scalar
         #    s_{t+1} = s_t + scaleGamma * (err_t − α_target)
         #    increases on miss, decreases on cover
-        self.scale_t = scale_init
+        self.scale_t = 1.0
 
         # ALPaCA model (lazy initialization — trained on warmup data)
         self.alpaca_model = None
@@ -599,16 +663,11 @@ class IntegratedAlpacaDtACI:
         gamma_scale_seq = np.zeros(T)
 
         # --- Main loop ---
-        for t in range(T):
-            eps = errors[t]
-
-            # Current controller values
+        for t, eps in enumerate(errors):
             alpha_t = self.alpha_t
-            sigma_T = self.sigma_ctrl.value
             s_t = self.scale_t
+            sigma_T = self.sigma_ctrl.value
 
-            alpha_seq[t] = alpha_t
-            scale_seq[t] = s_t
             sigma_T_seq[t] = sigma_T.copy()
             gamma_alpha_seq[t] = self.alpha_gamma
             gamma_sigma_seq[t] = self.sigma_ctrl.gammas[self.sigma_ctrl.cur_expert]
@@ -627,15 +686,43 @@ class IntegratedAlpacaDtACI:
             # 2) Optimize Σ:
             try:
                 recent_residuals = ctx - mu_pred if t >= self.n_context else np.zeros((0, d))
-                sigma_opt = optimize_sigma(sigma_T, self.lam, d, alpha_t, recent_residuals)
+                sigma_opt = optimize_sigma(sigma_T, self.lam, d, alpha_t, recent_residuals, prob_method=self.prob_method, prob_weight=self.prob_weight)
             except Exception:
                 sigma_opt = sigma_T.copy()
             sigma_opt_seq[t] = sigma_opt.copy()
 
-            # 3) Final ellipsoid: s_t · chi2_quantile · Σ_opt
-            alpha_clamp = np.clip(alpha_t, 0.001, 0.999)
+            # 3) Ghost Replay Buffer
+            alpha_b = alpha_t
+            scale_b = s_t
+            if self.replay_buffer_size > 0 and t >= self.replay_buffer_size:
+                try:
+                    B = self.replay_buffer_size
+                    # Replay via simulated residual geometry mapping
+                    res_hist = errors[t-B:t] - mu_pred_seq[t-B:t]
+                    inv_sig = np.linalg.pinv(sigma_opt)
+                    dists = np.einsum('ij,jk,ik->i', res_hist, inv_sig, res_hist)
+                    for b in range(B):
+                        a_clamp = np.clip(alpha_b, 0.001, 0.999)
+                        q = chi2.ppf(1 - a_clamp, df=d)
+                        if dists[b] > scale_b * q:
+                            # Missed
+                            alpha_b = np.clip(alpha_b + self.alpha_gamma * (self.alpha_target - 1.0), 0.001, 0.999)
+                            scale_b = np.clip(scale_b + self.scale_gamma * (1.0 - self.alpha_target), 0.1, 50.0)
+                        else:
+                            # Covered
+                            alpha_b = np.clip(alpha_b + self.alpha_gamma * (self.alpha_target - 0.0), 0.001, 0.999)
+                            scale_b = np.clip(scale_b + self.scale_gamma * (0.0 - self.alpha_target), 0.1, 50.0)
+                except Exception:
+                    pass
+
+            # Log jump-started boundaries for visualization
+            alpha_seq[t] = alpha_b
+            scale_seq[t] = scale_b
+
+            # 4) Final ellipsoid: ghost_s_t · ghost_chi2_quantile · Σ_opt
+            alpha_clamp = np.clip(alpha_b, 0.001, 0.999)
             chi2_scale = chi2.ppf(1 - alpha_clamp, df=d)
-            final_sigma = s_t * chi2_scale * sigma_opt
+            final_sigma = scale_b * chi2_scale * sigma_opt
 
             # Calculate residual relative to ALPaCA's predicted shift
             residual_t = eps - mu_pred
@@ -657,13 +744,14 @@ class IntegratedAlpacaDtACI:
             #    α_t: simple scalar update (R code: alphaT + alphaGamma*(alpha - err_t))
             #    If covered (err=0): α increases → chi2_scale decreases → tighter
             #    If missed  (err=1): α decreases → chi2_scale increases → wider
+            #    α_t: simple scalar update using physical error
             self.alpha_t = np.clip(
                 self.alpha_t + self.alpha_gamma * (self.alpha_target - err_t),
                 0.001, 0.999
             )
 
             #    Σ_T: DtACI expert pool (shape adaptation uses residual variance)
-            self.sigma_ctrl.update(residual_t, err_t, s_t * chi2_scale)
+            self.sigma_ctrl.update(residual_t, err_t, scale_b * chi2_scale)
 
             #    s_t: simple scalar update (increases on miss, decreases on cover)
             self.scale_t = np.clip(
@@ -675,7 +763,7 @@ class IntegratedAlpacaDtACI:
             if verbose and (t + 1) % 200 == 0:
                 rolling_cov = coverage_seq[max(0, t - 199):t + 1].mean()
                 print(f"  Step {t+1}/{T} | rolling_cov: {rolling_cov:.3f} | "
-                      f"α_t: {self.alpha_t:.4f} | s_t: {self.scale_t:.4f} | "
+                      f"α_t (ghost): {alpha_b:.4f} | s_t (ghost): {scale_b:.4f} | "
                       f"det(Σ_opt): {np.linalg.det(sigma_opt):.4e}")
 
         results = {

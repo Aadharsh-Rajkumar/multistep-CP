@@ -58,8 +58,8 @@ def plot_ellipse_points(Sigma, center=(0, 0), npts=100):
 #  EXPERIMENT 1: Simulated 2D Regime Shift
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
-    """Run on simulated 2D regime-shift data with different λ values."""
+def run_simulated_experiment(output_dir, lambda_values=None, buffer_values=None, T=2000, gap=500, prob_method="empirical", prob_weight=10.0):
+    """Run on simulated 2D regime-shift data with different λ and B (buffer) values."""
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -73,16 +73,24 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
 
     if lambda_values is None:
         lambda_values = [0.5, 1.0, 2.0, 5.0, 10.0]
+    if buffer_values is None:
+        buffer_values = [0]
+
+    configs = []
+    for lam in lambda_values:
+        for b in buffer_values:
+            configs.append((lam, b))
 
     all_results = {}
     print(f"\n{'='*70}")
     print(f"  EXPERIMENT: Simulated 2D Regime Shift (T={T}, gap={gap})")
-    print(f"  Lambda values: {lambda_values}")
+    print(f"  Configs (λ, B): {configs}")
     print(f"{'='*70}")
 
-    for lam in lambda_values:
+    for lam, b in configs:
+        key = f"λ={lam}, B={b}"
         print(f"\n{'─'*50}")
-        print(f"  λ = {lam}")
+        print(f"  {key}")
         print(f"{'─'*50}")
 
         system = IntegratedAlpacaDtACI(
@@ -90,6 +98,9 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
             n_context=10, lam=lam,
             alpha_gamma=0.05, scale_gamma=0.05,
             warmup=100, alpaca_train_iters=300,
+            replay_buffer_size=b,
+            prob_method=prob_method,
+            prob_weight=prob_weight,
             alpaca_kwargs={
                 "nn_layers": [64, 32],
                 "lr": 0.001,
@@ -100,41 +111,48 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
         )
 
         results = system.run(errors, verbose=True)
+        results["config_name"] = key
         results["lambda"] = lam
-        all_results[lam] = results
+        results["buffer"] = b
+        all_results[key] = results
 
     # ── PLOT 1: Rolling Coverage Comparison ──
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, axes = plt.subplots(len(configs), 1, figsize=(14, 2*len(configs)), sharex=True, sharey=True)
+    if len(configs) == 1:
+        axes = [axes]
     window = 200
-    colors = cm.viridis(np.linspace(0.1, 0.9, len(lambda_values)))
+    colors = cm.viridis(np.linspace(0.1, 0.9, len(configs)))
 
-    for i, lam in enumerate(lambda_values):
-        cov = all_results[lam]["coverage_seq"]
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        cov = all_results[key]["coverage_seq"]
         rolling = np.convolve(cov, np.ones(window)/window, mode='valid')
-        ax.plot(np.arange(len(rolling)), rolling,
-                color=colors[i], linewidth=1.5, label=f"λ={lam}")
+        axes[i].plot(np.arange(len(rolling)), rolling,
+                color=colors[i], linewidth=1.5, label=key)
+        axes[i].axhline(y=0.9, color='black', linestyle='--', linewidth=1.5)
+        switch_times = np.arange(gap, T, gap)
+        for st in switch_times:
+            axes[i].axvline(x=st, color='grey', linestyle=':', alpha=0.5)
+        axes[i].set_ylabel("Cov", fontsize=11)
+        axes[i].legend(loc='lower right', fontsize=10)
+        axes[i].grid(True, alpha=0.3)
 
-    ax.axhline(y=0.9, color='black', linestyle='--', linewidth=1.5, label='Target (90%)')
-    switch_times = np.arange(gap, T, gap)
-    for st in switch_times:
-        ax.axvline(x=st, color='grey', linestyle=':', alpha=0.5)
-    ax.set_xlabel("Timestep", fontsize=13)
-    ax.set_ylabel("Rolling Coverage", fontsize=13)
-    ax.set_title("Rolling Coverage vs λ (Regularization Weight)", fontsize=15)
-    ax.legend(loc='lower right', fontsize=10)
-    ax.set_ylim(0.5, 1.05)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+    axes[-1].set_xlabel("Timestep", fontsize=13)
+    plt.suptitle("Rolling Coverage Multi-Buffer Sweep Tracking", fontsize=15)
+    plt.ylim(0.5, 1.05)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(os.path.join(output_dir, "coverage_comparison.png"), dpi=150)
     plt.close()
     print(f"\n  Saved: coverage_comparison.png")
 
     # ── PLOT 2: Adaptive α_t Trajectories ──
     fig, ax = plt.subplots(figsize=(14, 4))
-    for i, lam in enumerate(lambda_values):
-        ax.plot(all_results[lam]["alpha_seq"], color=colors[i],
-                linewidth=0.8, alpha=0.7, label=f"λ={lam}")
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        ax.plot(all_results[key]["alpha_seq"], color=colors[i],
+                linewidth=0.8, alpha=0.7, label=key)
     ax.axhline(y=0.1, color='black', linestyle='--', linewidth=1.5)
+    switch_times = np.arange(gap, T, gap)
     for st in switch_times:
         ax.axvline(x=st, color='grey', linestyle=':', alpha=0.5)
     ax.set_xlabel("Timestep", fontsize=13)
@@ -149,9 +167,10 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
 
     # ── PLOT 3: Scale Factor s_t Trajectories ──
     fig, ax = plt.subplots(figsize=(14, 4))
-    for i, lam in enumerate(lambda_values):
-        ax.plot(all_results[lam]["scale_seq"], color=colors[i],
-                linewidth=0.8, alpha=0.7, label=f"λ={lam}")
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        ax.plot(all_results[key]["scale_seq"], color=colors[i],
+                linewidth=0.8, alpha=0.7, label=key)
     for st in switch_times:
         ax.axvline(x=st, color='grey', linestyle=':', alpha=0.5)
     ax.set_xlabel("Timestep", fontsize=13)
@@ -166,10 +185,11 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
 
     # ── PLOT 4: Ellipsoid Volume (det) Over Time ──
     fig, ax = plt.subplots(figsize=(14, 4))
-    for i, lam in enumerate(lambda_values):
-        vols = np.clip(all_results[lam]["volume_seq"], 0, np.percentile(
-            all_results[lam]["volume_seq"], 99))
-        ax.plot(vols, color=colors[i], linewidth=0.8, alpha=0.7, label=f"λ={lam}")
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        vols = np.clip(all_results[key]["volume_seq"], 0, np.percentile(
+            all_results[key]["volume_seq"], 99))
+        ax.plot(vols, color=colors[i], linewidth=0.8, alpha=0.7, label=key)
     for st in switch_times:
         ax.axvline(x=st, color='grey', linestyle=':', alpha=0.5)
     ax.set_xlabel("Timestep", fontsize=13)
@@ -182,12 +202,12 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
     plt.close()
     print(f"  Saved: volume_trajectories.png")
 
-    # ── PLOT 5: Ellipsoid Snapshots for Best λ ──
-    # Find λ with coverage closest to target
-    best_lam = min(lambda_values,
-                   key=lambda l: abs(all_results[l]["coverage_seq"].mean() - 0.9))
-    best = all_results[best_lam]
-    print(f"\n  Best λ = {best_lam} (coverage = {best['coverage_seq'].mean():.4f})")
+    # ── PLOT 5: Ellipsoid Snapshots for Best Config ──
+    # Find config with coverage closest to target
+    best_config_key = min(all_results.keys(),
+                   key=lambda k: abs(all_results[k]["coverage_seq"].mean() - 0.9))
+    best = all_results[best_config_key]
+    print(f"\n  Best Config = {best_config_key} (coverage = {best['coverage_seq'].mean():.4f})")
 
     snapshots = [200, 400, 600, 800, 1200, 1500, 1800, 1950]
     snapshots = [s for s in snapshots if s < T]
@@ -234,52 +254,39 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
         if i == 0:
             ax.legend(fontsize=8)
 
-    plt.suptitle(f"Ellipsoid Evolution (λ={best_lam}, Blue=Learned, Red=True)",
+    plt.suptitle(f"Ellipsoid Evolution ({best_config_key}, Blue=Learned, Red=True)",
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "ellipsoid_snapshots.png"), dpi=150)
     plt.close()
     print(f"  Saved: ellipsoid_snapshots.png")
 
-    # ── PLOT 6: Summary Bar Chart ──
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    coverages = [all_results[l]["coverage_seq"].mean() for l in lambda_values]
-    avg_volumes = [np.mean(all_results[l]["volume_seq"]) for l in lambda_values]
-    frob_diffs = []
-    for l in lambda_values:
-        diffs = []
-        for t in range(T):
-            if (all_results[l]["sigma_opt_seq"][t] is not None and
-                    all_results[l]["sigma_T_seq"][t] is not None):
-                diffs.append(np.linalg.norm(
-                    all_results[l]["sigma_opt_seq"][t] - all_results[l]["sigma_T_seq"][t], 'fro'))
-        frob_diffs.append(np.mean(diffs) if diffs else 0)
-
-    lam_labels = [str(l) for l in lambda_values]
-
-    axes[0].bar(lam_labels, coverages, color=[colors[i] for i in range(len(lambda_values))])
-    axes[0].axhline(y=0.9, color='red', linestyle='--', linewidth=1.5)
-    axes[0].set_ylabel("Mean Coverage", fontsize=12)
-    axes[0].set_xlabel("λ", fontsize=12)
-    axes[0].set_title("Coverage by λ", fontsize=13)
-    axes[0].set_ylim(0.7, 1.0)
-
-    axes[1].bar(lam_labels, avg_volumes, color=[colors[i] for i in range(len(lambda_values))])
-    axes[1].set_ylabel("Mean Volume", fontsize=12)
-    axes[1].set_xlabel("λ", fontsize=12)
-    axes[1].set_title("Avg Ellipsoid Volume by λ", fontsize=13)
-
-    axes[2].bar(lam_labels, frob_diffs, color=[colors[i] for i in range(len(lambda_values))])
-    axes[2].set_ylabel("Mean ‖Σ_opt − Σ_T‖_F", fontsize=12)
-    axes[2].set_xlabel("λ", fontsize=12)
-    axes[2].set_title("Σ_opt − Σ_T Difference by λ", fontsize=13)
-
-    plt.suptitle("Hyperparameter Summary", fontsize=14, fontweight='bold')
+    # ── PLOT 6: Final Configuration Stats Summary ──
+    fig, ax = plt.subplots(figsize=(8, 5))
+    config_labels = list(all_results.keys())
+    covs = [all_results[k]["coverage_seq"].mean() for k in config_labels]
+    
+    ax.bar(config_labels, covs, color=[cm.viridis(np.linspace(0.1, 0.9, len(configs)))[i] for i in range(len(configs))])
+    ax.axhline(y=0.9, color='r', linestyle='--', linewidth=2)
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("Final Overall Coverage")
+    ax.set_title("Configuration Coverage Sweep")
+    plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "lambda_summary.png"), dpi=150)
+    plt.savefig(os.path.join(output_dir, "config_summary.png"), dpi=150)
     plt.close()
-    print(f"  Saved: lambda_summary.png")
+    print(f"  Saved: config_summary.png")
+
+    print(f"\n{'='*70}")
+    print(f"  CONFIGURATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"  {'Config':>15} | {'Coverage':>10} | {'Avg Volume':>12}")
+    print(f"  {'─'*15}-+-{'─'*10}-+-{'─'*12}")
+    for k in config_labels:
+        c = all_results[k]["coverage_seq"].mean()
+        v = all_results[k]["volume_seq"].mean()
+        print(f"  {k:>15} | {c:>10.4f} | {v:>12.4e}")
+    print(f"{'='*70}\n")
 
     # ── PLOT 7: Mahalanobis Distances ──
     fig, ax = plt.subplots(figsize=(14, 4))
@@ -290,24 +297,13 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
     ax.set_ylim(0, np.clip(np.percentile(best["mahal_seq"], 99), 5, 20))
     ax.set_xlabel("Timestep", fontsize=13)
     ax.set_ylabel("Mahalanobis Distance", fontsize=13)
-    ax.set_title(f"Mahalanobis Distances (λ={best_lam})", fontsize=15)
+    ax.set_title(f"Mahalanobis Distances ({best_config_key})", fontsize=15)
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "mahalanobis_distances.png"), dpi=150)
     plt.close()
     print(f"  Saved: mahalanobis_distances.png")
-
-    # Print summary table
-    print(f"\n{'='*70}")
-    print(f"  λ SWEEP SUMMARY")
-    print(f"{'='*70}")
-    print(f"  {'λ':>8} | {'Coverage':>10} | {'Avg Volume':>12} | {'‖Σ_opt-Σ_T‖':>14}")
-    print(f"  {'─'*8}-+-{'─'*10}-+-{'─'*12}-+-{'─'*14}")
-    for i, lam in enumerate(lambda_values):
-        print(f"  {lam:>8.2f} | {coverages[i]:>10.4f} | {avg_volumes[i]:>12.4e} | "
-              f"{frob_diffs[i]:>14.4e}")
-    print(f"{'='*70}")
 
     return all_results
 
@@ -316,7 +312,7 @@ def run_simulated_experiment(output_dir, lambda_values=None, T=2000, gap=500):
 #  EXPERIMENT 2: Stock Returns
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_stock_experiment(output_dir, lambda_values=None):
+def run_stock_experiment(output_dir, lambda_values=None, buffer_values=None, prob_method="empirical", prob_weight=10.0):
     """Run on AMD/Nvidia daily returns if data files are available."""
 
     stock_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -353,35 +349,49 @@ def run_stock_experiment(output_dir, lambda_values=None):
 
     if lambda_values is None:
         lambda_values = [0.1, 1.0, 5.0]
+    if buffer_values is None:
+        buffer_values = [0]
+        
+    configs = []
+    for lam in lambda_values:
+        for b in buffer_values:
+            configs.append((lam, b))
 
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*70}")
     print(f"  EXPERIMENT: Stock Returns (AMD/Nvidia), T={len(stock_errors)}")
+    print(f"  Configs: {configs}")
     print(f"{'='*70}")
 
     all_results = {}
-    for lam in lambda_values:
-        print(f"\n  λ = {lam}")
+    for lam, b in configs:
+        key = f"λ={lam}, B={b}"
+        print(f"\n  {key}")
         system = IntegratedAlpacaDtACI(
             d=2, alpha_target=0.1,
             n_context=10, lam=lam,
             alpha_gamma=0.05, scale_gamma=0.05,
             warmup=100, alpaca_train_iters=300,
+            replay_buffer_size=b,
+            prob_method=prob_method,
+            prob_weight=prob_weight,
             alpaca_kwargs={"nn_layers": [64, 32], "lr": 0.001, "sigma_eps": 0.1}
         )
         results = system.run(stock_errors, verbose=True)
-        all_results[lam] = results
+        results["config"] = key
+        all_results[key] = results
 
     # Quick coverage plot
     T = len(stock_errors)
     fig, ax = plt.subplots(figsize=(14, 5))
-    colors = cm.viridis(np.linspace(0.1, 0.9, len(lambda_values)))
+    colors = cm.viridis(np.linspace(0.1, 0.9, len(configs)))
     window = 200
-    for i, lam in enumerate(lambda_values):
-        cov = all_results[lam]["coverage_seq"]
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        cov = all_results[key]["coverage_seq"]
         rolling = np.convolve(cov, np.ones(window)/window, mode='valid')
-        ax.plot(rolling, color=colors[i], linewidth=1.5, label=f"λ={lam}")
+        ax.plot(rolling, color=colors[i], linewidth=1.5, label=key)
     ax.axhline(y=0.9, color='black', linestyle='--', linewidth=1.5)
     ax.set_xlabel("Timestep", fontsize=13)
     ax.set_ylabel("Rolling Coverage", fontsize=13)
@@ -394,9 +404,9 @@ def run_stock_experiment(output_dir, lambda_values=None):
     plt.close()
     print(f"\n  Saved: stock_coverage.png")
 
-    # Find best lam
-    best_lam = min(lambda_values, key=lambda l: abs(all_results[l]["coverage_seq"].mean() - 0.9))
-    best = all_results[best_lam]
+    # Find best config
+    best_config_key = min(all_results.keys(), key=lambda k: abs(all_results[k]["coverage_seq"].mean() - 0.9))
+    best = all_results[best_config_key]
 
     # Plot Ellipsoid Snapshots for best lambda
     snapshots = [500, 1000, 2000, 3000, 4000, 5000]
@@ -422,7 +432,7 @@ def run_stock_experiment(output_dir, lambda_values=None):
             final_S = s_t * chi2_q * best["sigma_opt_seq"][t_snap]
             try:
                 ex, ey = plot_ellipse_points(final_S, center=mu_pred)
-                ax.plot(ex, ey, 'b-', linewidth=2, label=f'Learned (λ={best_lam})', zorder=3)
+                ax.plot(ex, ey, 'b-', linewidth=2, label=f'Learned ({best_config_key})', zorder=3)
             except Exception:
                 pass
         
@@ -437,7 +447,7 @@ def run_stock_experiment(output_dir, lambda_values=None):
         if i == 0:
             ax.legend(fontsize=8)
 
-    plt.suptitle(f"Stock Returns Ellipsoid Evolution (λ={best_lam})", fontsize=14, fontweight='bold')
+    plt.suptitle(f"Stock Returns Ellipsoid Evolution ({best_config_key})", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "stock_ellipsoid_snapshots.png"), dpi=150)
     plt.close()
@@ -451,8 +461,9 @@ def run_stock_experiment(output_dir, lambda_values=None):
     scatter = stock_errors[idx_start:t_comp]
     ax.scatter(scatter[:, 0], scatter[:, 1], c='grey', alpha=0.4, s=15, zorder=1)
     
-    for i, lam in enumerate(lambda_values):
-        res = all_results[lam]
+    for i, (lam, b) in enumerate(configs):
+        key = f"λ={lam}, B={b}"
+        res = all_results[key]
         if res["sigma_opt_seq"][t_comp] is not None:
             s_t = res["scale_seq"][t_comp]
             from scipy.stats import chi2
@@ -497,28 +508,47 @@ if __name__ == "__main__":
     parser.add_argument("--lambdas", nargs="+", type=float,
                         default=None,
                         help="Lambda values to sweep (default: [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0])")
+    parser.add_argument("--buffers", nargs="+", type=int,
+                        default=[0],
+                        help="Replay buffer sizes (B) to sweep (e.g. 0 25 50 100)")
     parser.add_argument("--T", type=int, default=2000,
                         help="Number of timesteps for simulated data")
     parser.add_argument("--gap", type=int, default=500,
                         help="Regime switch gap for simulated data")
-    parser.add_argument("--output_dir", type=str, default=None,
-                        help="Output directory for results")
-
+    parser.add_argument("--prob-method", type=str, default="empirical", choices=["empirical", "moment", "davies", "none"],
+                        help="Probability evaluation method for Σ optimization.")
+    parser.add_argument("--prob-weight", type=float, default=10.0,
+                        help="Weight for the coverage penalty relative to volume/det.")
+    parser.add_argument("--tag", type=str, default="", help="Optional tag for result folder naming.")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    if args.output_dir is None:
-        output_dir = os.path.join(base_dir, "results", "integrated")
-    else:
-        output_dir = args.output_dir
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = timestamp
+    if args.tag:
+        folder_name += f"_{args.tag}"
+    output_dir = os.path.join(base_dir, "results", folder_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n======================================================================")
+    print(f" INTEGRATED ALPaCA-DtACI PIPELINE")
+    print(f" Output Dir: {output_dir}")
+    print(f"======================================================================\n")
 
     if args.experiment in ("simulated", "all"):
         sim_dir = os.path.join(output_dir, "simulated_2d")
         run_simulated_experiment(sim_dir, lambda_values=args.lambdas,
-                                 T=args.T, gap=args.gap)
+                                 buffer_values=args.buffers,
+                                 T=args.T, gap=args.gap,
+                                 prob_method=args.prob_method,
+                                 prob_weight=args.prob_weight)
 
     if args.experiment in ("stocks", "all"):
         stock_dir = os.path.join(output_dir, "stocks")
-        run_stock_experiment(stock_dir, lambda_values=args.lambdas)
+        run_stock_experiment(stock_dir, lambda_values=args.lambdas, 
+                             buffer_values=args.buffers,
+                             prob_method=args.prob_method,
+                             prob_weight=args.prob_weight)
 
     print("\n✓ All experiments complete!")

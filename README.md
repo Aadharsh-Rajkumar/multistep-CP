@@ -81,6 +81,6 @@ python run_integrated_experiment.py --experiment stocks --lambdas 10.0
 
 ## Acknowledgements
 
-This integrated system builds upon the core frameworks established in the following foundational repositories. We deeply credit the original authors:
+This integrated system builds upon the core frameworks established in the following foundational repositories. We credit the original authors:
 - **ALPaCA**: [StanfordASL/ALPaCA](https://github.com/StanfordASL/ALPaCA)
 - **DtACI**: [isgibbs/DtACI](https://github.com/isgibbs/DtACI)
