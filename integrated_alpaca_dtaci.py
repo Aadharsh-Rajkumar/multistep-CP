@@ -305,32 +305,52 @@ def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min
             coverage_penalty = 0.0
         elif len(recent_residuals) > 0:
             inv_Sigma = np.linalg.pinv(Sigma)
+            q_alpha = chi2.ppf(1 - alpha_t, df=d) if alpha_t is not None else chi2.ppf(0.9, df=d)
             
             if prob_method == "empirical":
                 # Differentiable sigmoid approximation
                 mahal_dists = np.einsum('ij,jk,ik->i', recent_residuals, inv_Sigma, recent_residuals)
-                pr = np.mean(1.0 / (1.0 + np.exp(-10.0 * (1.0 - mahal_dists))))
+                pr = np.mean(1.0 / (1.0 + np.exp(-10.0 * (q_alpha - mahal_dists))))
+                coverage_penalty = prob_weight * (pr - (1.0 - alpha_t))**2
                 
             # This is the best option as of now for real-time online CP
             elif prob_method == "moment":
-                # Welch-Satterthwaite / Pearson moment matching
-                Sigma_e = np.cov(recent_residuals, rowvar=False) if len(recent_residuals) > 1 else np.eye(d)
-                mu_e = np.mean(recent_residuals, axis=0)
-                A = inv_Sigma
-                mu_e = np.zeros(d) # Force zero-mean: coverage is relative to ALPaCA prediction center
-                AS = A @ Sigma_e
-                E_Q = np.trace(AS) + mu_e.T @ A @ mu_e
-                Var_Q = 2 * np.trace(AS @ AS) + 4 * mu_e.T @ A @ Sigma_e @ A @ mu_e
-                import scipy.stats
-                if E_Q > 1e-6 and Var_Q > 1e-6:
-                    pr = scipy.stats.gamma.cdf(1.0, a=(E_Q**2)/Var_Q, scale=Var_Q/E_Q)
+                if len(recent_residuals) > 1:
+                    # Uncentered second moment captures both variance and origin-offset bias
+                    Sigma_e = (recent_residuals.T @ recent_residuals) / len(recent_residuals)
                 else:
-                    pr = 0.0
+                    Sigma_e = np.eye(d)
+                Sigma_e = Sigma_e + 1e-6 * np.eye(d)
+
+                AS = inv_Sigma @ Sigma_e
+                AS = 0.5 * (AS + AS.T)
+
+                E_Q = np.trace(AS)
+                Var_Q = 2.0 * np.trace(AS @ AS)
+
+                E_Q = np.clip(E_Q, 1e-8, 1e6)
+                Var_Q = np.clip(Var_Q, 1e-8, 1e6)
+
+                k = (E_Q ** 2) / (Var_Q + 1e-8)
+                theta = (Var_Q + 1e-8) / (E_Q + 1e-8)
+
+                try:
+                    import scipy.stats
+                    pr = scipy.stats.gamma.cdf(q_alpha, a=k, scale=theta)
+                except:
+                    Q = np.einsum('ij,jk,ik->i', recent_residuals, inv_Sigma, recent_residuals)
+                    pr = np.mean(Q < q_alpha)
+
+                coverage_penalty = prob_weight * (pr - (1.0 - alpha_t))**2
                     
             elif prob_method == "davies":
                 # Exact Gil-Pelaez CF Numerical Integration
-                Sigma_e = np.cov(recent_residuals, rowvar=False) if len(recent_residuals) > 1 else np.eye(d)
-                mu_e = np.zeros(d) # Force zero-mean: coverage is relative to ALPaCA prediction center
+                if len(recent_residuals) > 1:
+                    Sigma_e = (recent_residuals.T @ recent_residuals) / len(recent_residuals)
+                else:
+                    Sigma_e = np.eye(d)
+                # Force zero-mean inside the algorithm since uncentered Sigma_e incorporates the bias
+                mu_e = np.zeros(d)
                 A = inv_Sigma
                 try:
                     L_e = np.linalg.cholesky(Sigma_e)
@@ -357,13 +377,12 @@ def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min
                     return res
                 
                 t_vals = np.linspace(1e-5, 20.0, 150)
-                y_vals = np.imag(cf_vec(t_vals) * np.exp(-1j * t_vals * 1.0)) / t_vals
+                y_vals = np.imag(cf_vec(t_vals) * np.exp(-1j * t_vals * q_alpha)) / t_vals
                 integral = np.trapz(y_vals, t_vals)
                 
                 pr = np.clip(0.5 - (1.0 / np.pi) * integral, 0.0, 1.0)
+                coverage_penalty = prob_weight * (pr - (1.0 - alpha_t))**2
                 
-            det_T = np.linalg.det(sigma_T)
-            coverage_penalty = prob_weight * det_T * abs(pr - (1.0 - alpha_t))
         else:
             coverage_penalty = 0.0
 
@@ -493,7 +512,8 @@ class IntegratedAlpacaDtACI:
                  alpaca_kwargs=None,
                  replay_buffer_size=0,
                  prob_method="empirical",
-                 prob_weight=10.0):
+                 prob_weight=10.0,
+                 force_zero_mean=False):
         """
         d: dimensionality of the time series
         alpha_target: target expected error rate (e.g., 0.1 for 90% coverage)
@@ -519,6 +539,7 @@ class IntegratedAlpacaDtACI:
         self.replay_buffer_size = replay_buffer_size
         self.prob_method = prob_method
         self.prob_weight = prob_weight
+        self.force_zero_mean = force_zero_mean
 
         self.gammas = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
 
@@ -600,6 +621,9 @@ class IntegratedAlpacaDtACI:
         mu, sig = self.alpaca_model.test(x_ctx, y_ctx, x_input)
         mu_pred = mu[0, 0, :]                  # (d,)
         sig_pred = sig[0, 0, :, :]             # (d, d)
+
+        if getattr(self, 'force_zero_mean', False):
+            mu_pred = np.zeros(self.d)
 
         return mu_pred, sig_pred
 
@@ -738,7 +762,7 @@ class IntegratedAlpacaDtACI:
             coverage_seq[t] = covered
             err_t = 1.0 - covered       # 1 if missed
 
-            volume_seq[t] = np.linalg.det(final_sigma)
+            volume_seq[t] = max(np.linalg.det(final_sigma), 1e-12)
 
             # 5) Update controllers
             #    α_t: simple scalar update (R code: alphaT + alphaGamma*(alpha - err_t))
