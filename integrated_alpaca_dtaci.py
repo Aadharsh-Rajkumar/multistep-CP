@@ -22,6 +22,45 @@ from scipy.optimize import minimize
 from scipy.stats import chi2
 from copy import deepcopy
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PID-INSPIRED SATURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mytan(x):
+    """Safe tangent that returns ±inf at ±π/2 boundaries."""
+    if x >= np.pi / 2:
+        return np.inf
+    elif x <= -np.pi / 2:
+        return -np.inf
+    else:
+        return np.tan(x)
+
+
+def saturation_fn(integrator_sum, t, C_sat=0.5, K_I=1.0):
+    """
+    PID-paper saturation function (log variant) to prevent integrator windup.
+    
+    Maps the cumulative coverage error through a bounded nonlinearity:
+        sat(x, t) = K_I * tan( x * log(t+1) / (C_sat * (t+1)) )
+    
+    This guarantees the integrator's contribution stays bounded as t → ∞,
+    which is required for the long-run coverage guarantee in the PID paper.
+    
+    Args:
+        integrator_sum: cumulative sum of (α_target - err_t) over all t
+        t: current timestep (0-indexed)
+        C_sat: saturation constant (controls how aggressively to bound)
+        K_I: integrator gain
+    
+    Returns:
+        Saturated integrator output (bounded scalar)
+    """
+    if K_I == 0:
+        return 0.0
+    arg = integrator_sum * np.log(t + 2) / (C_sat * (t + 2))
+    return K_I * _mytan(arg)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DATA GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -206,7 +245,11 @@ class DtACISigmaPool:
 
             # Update the expert's Sigma
             g = self.gammas[j]
-            self.expert_sigmas[j] = (1 - g) * self.expert_sigmas[j] + g * outer + reg
+            new_sigma = (1 - g) * self.expert_sigmas[j] + g * outer + reg
+            # NaN guard: reset expert sigma if update produces invalid values
+            if np.any(np.isnan(new_sigma)) or np.any(np.isinf(new_sigma)):
+                new_sigma = outer + reg
+            self.expert_sigmas[j] = new_sigma
 
         # Expert weighting
         if self.eta < np.inf:
@@ -405,6 +448,10 @@ def optimize_sigma(sigma_T, lam, d, alpha_t, recent_residuals, max_iter=200, min
     L_opt = unpack_L(result.x)
     sigma_opt = L_opt @ L_opt.T
 
+    # NaN guard (PID paper principle: never propagate invalid states)
+    if np.any(np.isnan(sigma_opt)) or np.any(np.isinf(sigma_opt)):
+        sigma_opt = sigma_T.copy()
+
     return sigma_opt
 
 
@@ -559,6 +606,12 @@ class IntegratedAlpacaDtACI:
         #    s_{t+1} = s_t + scaleGamma * (err_t − α_target)
         #    increases on miss, decreases on cover
         self.scale_t = 1.0
+
+        # PID-inspired integrator state (from Conformal PID paper)
+        # Tracks cumulative coverage error for saturation-based anti-windup
+        self.integrator_sum = 0.0
+        self.C_sat = 0.5     # saturation constant
+        self.K_I = 0.5       # integrator gain
 
         # ALPaCA model (lazy initialization — trained on warmup data)
         self.alpaca_model = None
@@ -764,24 +817,40 @@ class IntegratedAlpacaDtACI:
 
             volume_seq[t] = max(np.linalg.det(final_sigma), 1e-12)
 
-            # 5) Update controllers
-            #    α_t: simple scalar update (R code: alphaT + alphaGamma*(alpha - err_t))
+            # 5) Update controllers with PID-inspired saturation
+
+            #    P-term: α_t proportional update
+            #    α_{t+1} = α_t + αGamma * (α_target − err_t)
             #    If covered (err=0): α increases → chi2_scale decreases → tighter
             #    If missed  (err=1): α decreases → chi2_scale increases → wider
-            #    α_t: simple scalar update using physical error
-            self.alpha_t = np.clip(
-                self.alpha_t + self.alpha_gamma * (self.alpha_target - err_t),
-                0.001, 0.999
+            p_update = self.alpha_gamma * (self.alpha_target - err_t)
+
+            #    I-term: Saturated integrator to prevent windup
+            #    Accumulates coverage error, but bounded via tan(·) saturation
+            self.integrator_sum += (self.alpha_target - err_t)
+            i_update = saturation_fn(
+                self.integrator_sum, t,
+                C_sat=self.C_sat, K_I=self.K_I
             )
+
+            #    Combined PID α update (P + saturated-I)
+            new_alpha = self.alpha_target + p_update + self.alpha_gamma * i_update
+            
+            #    NaN guard (PID paper: skip update if NaN, reset integrator)
+            if np.isnan(new_alpha) or np.isinf(new_alpha):
+                new_alpha = self.alpha_target
+                self.integrator_sum = 0.0  # Reset integrator on NaN
+            
+            self.alpha_t = np.clip(new_alpha, 0.001, 0.999)
 
             #    Σ_T: DtACI expert pool (shape adaptation uses residual variance)
             self.sigma_ctrl.update(residual_t, err_t, scale_b * chi2_scale)
 
-            #    s_t: simple scalar update (increases on miss, decreases on cover)
-            self.scale_t = np.clip(
-                self.scale_t + self.scale_gamma * (err_t - self.alpha_target),
-                0.1, 50.0
-            )
+            #    s_t: scalar update with NaN guard
+            new_scale = self.scale_t + self.scale_gamma * (err_t - self.alpha_target)
+            if np.isnan(new_scale) or np.isinf(new_scale):
+                new_scale = 1.0  # Reset scale on NaN
+            self.scale_t = np.clip(new_scale, 0.1, 50.0)
 
             # Progress
             if verbose and (t + 1) % 200 == 0:
