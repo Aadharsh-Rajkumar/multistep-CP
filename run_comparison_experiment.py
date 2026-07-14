@@ -45,6 +45,30 @@ def plot_ellipse_pts(ax, mu, sigma, color="blue", alpha=0.3, label=None):
         pass
 
 
+def alpha_horizon_matrix(result):
+    """Return an (N, T) alpha allocation matrix for heatmap plotting."""
+    if "alpha_horizon_seq" in result:
+        mat = np.asarray(result["alpha_horizon_seq"], dtype=float)
+        if mat.ndim == 2:
+            return mat.T
+
+    alpha_seq = np.asarray(result["alpha_seq"], dtype=float)
+    horizon = int(result.get("N", 10))
+    return np.tile(alpha_seq, (horizon, 1))
+
+
+def alpha_total_budget(result):
+    """Return total trajectory α budget after subtracting overlap correction."""
+    if "alpha_total_seq" in result:
+        return np.asarray(result["alpha_total_seq"], dtype=float)
+
+    alpha_seq = np.asarray(result["alpha_seq"], dtype=float)
+    horizon = int(result.get("N", 10))
+    correction = np.asarray(result.get("correction_seq", np.zeros_like(alpha_seq)),
+                            dtype=float)
+    return horizon * alpha_seq - correction
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMPARISON PLOTTING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -109,6 +133,88 @@ def plot_comparison(
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "cmp_alpha.png"), dpi=150)
+    plt.close()
+
+    # ─────────────────────────────────────────────
+    # 2b. Trajectory-level alpha heatmaps
+    # ─────────────────────────────────────────────
+    alpha_heat_2 = alpha_horizon_matrix(r2)
+    alpha_heat_2b = alpha_horizon_matrix(r2b)
+    vmin = min(np.nanmin(alpha_heat_2), np.nanmin(alpha_heat_2b))
+    vmax = max(np.nanmax(alpha_heat_2), np.nanmax(alpha_heat_2b))
+    if np.isclose(vmin, vmax):
+        pad = max(abs(vmin) * 0.05, 1e-4)
+        vmin -= pad
+        vmax += pad
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+    heatmaps = [
+        (axes[0], alpha_heat_2, label2),
+        (axes[1], alpha_heat_2b, label2b),
+    ]
+    for ax, alpha_heat, label in heatmaps:
+        im = ax.imshow(
+            alpha_heat,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+            extent=[0, T - 1, 1, alpha_heat.shape[0]],
+        )
+        ax.axvline(shift_t, color="red", ls=":", lw=2)
+        ax.set_ylabel("Horizon Step")
+        ax.set_title(label)
+
+    axes[-1].set_xlabel("Timestep")
+    fig.suptitle(f"{title_prefix}: Trajectory-Level Alpha Allocation Heatmap")
+    cbar = fig.colorbar(im, ax=axes, pad=0.02)
+    cbar.set_label("Allocated α")
+    plt.savefig(os.path.join(output_dir, "cmp_alpha_heatmap.png"), dpi=150,
+                bbox_inches="tight")
+    plt.close()
+
+    # ─────────────────────────────────────────────
+    # 2c. Total trajectory alpha budget after overlap
+    # ─────────────────────────────────────────────
+    budget2 = alpha_total_budget(r2)
+    budget2b = alpha_total_budget(r2b)
+    raw_budget2 = np.asarray(r2["alpha_seq"], dtype=float) * int(r2.get("N", 10))
+    raw_budget2b = np.asarray(r2b["alpha_seq"], dtype=float) * int(r2b.get("N", 10))
+    overlap2 = np.asarray(r2.get("correction_seq", np.zeros_like(budget2)),
+                          dtype=float)
+    overlap2b = np.asarray(r2b.get("correction_seq", np.zeros_like(budget2b)),
+                           dtype=float)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    ax = axes[0]
+    ax.plot(budget2, color=c_v2, lw=2, label=label2 + " post-overlap")
+    ax.plot(budget2b, color=c_v2b, lw=2, label=label2b + " post-overlap")
+    ax.plot(raw_budget2, color=c_v2, ls="--", alpha=0.35,
+            label=label2 + " raw Σα")
+    ax.plot(raw_budget2b, color=c_v2b, ls="--", alpha=0.35,
+            label=label2b + " raw Σα")
+    ax.axhline(0.1, color="black", ls=":", alpha=0.4, label="Target α")
+    ax.axvline(shift_t, color="red", ls=":", lw=2, label="Regime shift")
+    ax.set_ylabel("Total α Budget")
+    ax.set_title("Total Alpha Budget After Overlap Subtraction")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(overlap2, color=c_v2, lw=2, label=label2 + " overlap correction")
+    ax.plot(overlap2b, color=c_v2b, lw=2, label=label2b + " overlap correction")
+    ax.axvline(shift_t, color="red", ls=":", lw=2, label="Regime shift")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Overlap Correction")
+    ax.set_title("Overlap Component Subtracted From Raw Budget")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"{title_prefix}: Total Alpha Budget and Overlap Component")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "cmp_alpha_total_budget.png"), dpi=150)
     plt.close()
 
     # ─────────────────────────────────────────────
@@ -330,7 +436,7 @@ def plot_comparison(
 #  ROBOTICS EXPERIMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_robotics_comparison(mode="dtaci"):
+def run_robotics_comparison(mode="dtaci", overlap_mode="raw"):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(__file__), "results", f"{timestamp}_v1_vs_v2_{mode}_robotics")
 
@@ -374,6 +480,7 @@ def run_robotics_comparison(mode="dtaci"):
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1alpha",
+            overlap_mode=overlap_mode,
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(tracking_errors, verbose=True)
@@ -386,6 +493,7 @@ def run_robotics_comparison(mode="dtaci"):
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(tracking_errors, verbose=True)
@@ -398,6 +506,7 @@ def run_robotics_comparison(mode="dtaci"):
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(tracking_errors, verbose=True)
@@ -407,10 +516,10 @@ def run_robotics_comparison(mode="dtaci"):
         kwargs_v2b = shared_kwargs.copy()
         kwargs_v2b["lam"] = 0.5
         kwargs_v2b["scale_gamma"] = 0.01
-        # Set eta_joint=0.0 to disable PID (Static)
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=0, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(tracking_errors, verbose=True)
@@ -426,7 +535,7 @@ def run_robotics_comparison(mode="dtaci"):
 #  STOCKS EXPERIMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_stocks_comparison(mode="dtaci"):
+def run_stocks_comparison(mode="dtaci", overlap_mode="raw"):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(__file__), "results", f"{timestamp}_v1_vs_v2_{mode}_stocks")
 
@@ -470,6 +579,7 @@ def run_stocks_comparison(mode="dtaci"):
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1alpha",
+            overlap_mode=overlap_mode,
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(errors, verbose=True)
@@ -481,6 +591,7 @@ def run_stocks_comparison(mode="dtaci"):
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(errors, verbose=True)
@@ -492,6 +603,7 @@ def run_stocks_comparison(mode="dtaci"):
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(errors, verbose=True)
@@ -503,6 +615,7 @@ def run_stocks_comparison(mode="dtaci"):
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=0, delta_conf=0.05, eta_joint=0.01,
             base_matrix_mode="alpaca_1sd",
+            overlap_mode=overlap_mode,
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(errors, verbose=True)
@@ -530,9 +643,13 @@ if __name__ == "__main__":
         "--mode", choices=["dtaci", "alpaca"], default="dtaci",
         help="Which systems to compare (dtaci vs granular alpaca diagnosis)"
     )
+    parser.add_argument(
+        "--overlap-mode", choices=["raw", "safe"], default="raw",
+        help="Use raw overlap estimates or conservative safe overlap estimates",
+    )
     args = parser.parse_args()
 
     if args.experiment in ["robotics", "both"]:
-        run_robotics_comparison(mode=args.mode)
+        run_robotics_comparison(mode=args.mode, overlap_mode=args.overlap_mode)
     if args.experiment in ["stocks", "both"]:
-        run_stocks_comparison(mode=args.mode)
+        run_stocks_comparison(mode=args.mode, overlap_mode=args.overlap_mode)

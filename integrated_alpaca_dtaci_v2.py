@@ -19,7 +19,7 @@ import sys
 import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import chi2
-from copy import deepcopy
+from collections import deque
 
 # Import all v1 components (no duplication)
 from integrated_alpaca_dtaci import (
@@ -48,7 +48,7 @@ class OverlapTable:
     Provides conservative lower bounds via Hoeffding margins.
     """
 
-    def __init__(self, K, delta_conf=0.05):
+    def __init__(self, K, delta_conf=0.05, c_bins=None, alpha_bins=None):
         """
         Args:
             K:          maximum lag to track (Δt ∈ {1, …, K})
@@ -56,55 +56,104 @@ class OverlapTable:
         """
         self.K = K
         self.delta_conf = delta_conf
-        self.n = np.zeros(K, dtype=np.int64)
-        self.omega_hat = np.zeros(K)
-        self.M2 = np.zeros(K)
+        self.c_bins = np.array(
+            c_bins if c_bins is not None
+            else [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, np.inf],
+            dtype=float,
+        )
+        self.alpha_bins = np.array(
+            alpha_bins if alpha_bins is not None
+            else [0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, np.inf],
+            dtype=float,
+        )
+        self.stats = {}
+        self.lag_stats = {}
 
-    def update(self, delta_t, Y):
-        """Update cell for lag *delta_t* with overlap indicator Y ∈ {0,1}."""
+    def _bin_value(self, value, bins):
+        idx = np.searchsorted(bins, float(value), side="right") - 1
+        return int(np.clip(idx, 0, len(bins) - 2))
+
+    def make_key(self, c_s, c_t, delta_t, alpha_s, alpha_t):
+        """Create a discretized overlap key."""
         if delta_t < 1 or delta_t > self.K:
+            return None
+        return (
+            self._bin_value(c_s, self.c_bins),
+            self._bin_value(c_t, self.c_bins),
+            int(delta_t),
+            self._bin_value(alpha_s, self.alpha_bins),
+            self._bin_value(alpha_t, self.alpha_bins),
+        )
+
+    def _update_stats(self, table, key, Y):
+        entry = table.get(key)
+        if entry is None:
+            entry = {"n": 0, "omega_hat": 0.0, "M2": 0.0}
+            table[key] = entry
+        entry["n"] += 1
+        old_mean = entry["omega_hat"]
+        entry["omega_hat"] += (Y - entry["omega_hat"]) / entry["n"]
+        entry["M2"] += (Y - old_mean) * (Y - entry["omega_hat"])
+
+    def update(self, c_s, c_t, delta_t, alpha_s, alpha_t, Y):
+        """Update the binned overlap table and lag-only fallback table."""
+        key = self.make_key(c_s, c_t, delta_t, alpha_s, alpha_t)
+        if key is None:
             return
-        idx = delta_t - 1
-        self.n[idx] += 1
-        old_mean = self.omega_hat[idx]
-        self.omega_hat[idx] += (Y - self.omega_hat[idx]) / self.n[idx]
-        self.M2[idx] += (Y - old_mean) * (Y - self.omega_hat[idx])
+        self._update_stats(self.stats, key, Y)
+        self._update_stats(self.lag_stats, int(delta_t), Y)
 
-    def get_variance(self, delta_t):
-        """Empirical variance for lag delta_t."""
-        idx = delta_t - 1
-        if self.n[idx] < 2:
+    def _get_entry(self, c_s, c_t, delta_t, alpha_s, alpha_t):
+        key = self.make_key(c_s, c_t, delta_t, alpha_s, alpha_t)
+        if key is None:
+            return None
+        entry = self.stats.get(key)
+        if entry is not None:
+            return entry
+        return self.lag_stats.get(int(delta_t))
+
+    def get_variance(self, c_s, c_t, delta_t, alpha_s, alpha_t):
+        """Empirical variance for a queried overlap cell."""
+        entry = self._get_entry(c_s, c_t, delta_t, alpha_s, alpha_t)
+        if entry is None or entry["n"] < 2:
             return 0.25
-        return self.M2[idx] / max(1, self.n[idx] - 1)
+        return entry["M2"] / max(1, entry["n"] - 1)
 
-    def get_safe_omega(self, delta_t):
+    def get_hat_omega(self, c_s, c_t, delta_t, alpha_s, alpha_t):
+        """Empirical overlap estimate ω̂ for the requested cell."""
+        entry = self._get_entry(c_s, c_t, delta_t, alpha_s, alpha_t)
+        if entry is None:
+            return 0.0
+        return float(entry["omega_hat"])
+
+    def get_safe_omega(self, c_s, c_t, delta_t, alpha_s, alpha_t):
         """
         Conservative lower bound:  ω^safe = max{0, ω̂ − M_H}.
 
         Hoeffding margin: M_H = sqrt( log(K/δ) / (2n) )
         """
-        if delta_t < 1 or delta_t > self.K:
+        entry = self._get_entry(c_s, c_t, delta_t, alpha_s, alpha_t)
+        if entry is None or entry["n"] < 2:
             return 0.0
-        idx = delta_t - 1
-        if self.n[idx] < 2:
-            return 0.0
-        delta_j = self.delta_conf / self.K
-        M = np.sqrt(np.log(1.0 / delta_j) / (2.0 * self.n[idx]))
-        return max(0.0, self.omega_hat[idx] - M)
+        delta_j = self.delta_conf / max(1, self.K)
+        M = np.sqrt(np.log(1.0 / delta_j) / (2.0 * entry["n"]))
+        return max(0.0, float(entry["omega_hat"]) - M)
 
-    def get_all_safe(self):
-        """Return dict {Δt: ω^safe} for Δt = 1…K."""
-        return {dt: self.get_safe_omega(dt) for dt in range(1, self.K + 1)}
+    def get_omega(self, c_s, c_t, delta_t, alpha_s, alpha_t, mode="safe"):
+        """Query either raw ω̂ or conservative ω^safe."""
+        if mode == "raw":
+            return self.get_hat_omega(c_s, c_t, delta_t, alpha_s, alpha_t)
+        return self.get_safe_omega(c_s, c_t, delta_t, alpha_s, alpha_t)
 
     def summary(self):
         """Print a diagnostic summary of the table."""
         lines = ["  OverlapTable summary (lag → ω̂, ω^safe, n):"]
         for dt in range(1, self.K + 1):
-            idx = dt - 1
-            ws = self.get_safe_omega(dt)
+            entry = self.lag_stats.get(dt, {"n": 0, "omega_hat": 0.0, "M2": 0.0})
+            ws = self.get_safe_omega(1.0, 1.0, dt, 0.01, 0.01)
             lines.append(
-                f"    Δt={dt:2d}  ω̂={self.omega_hat[idx]:.4f}  "
-                f"ω^safe={ws:.4f}  n={self.n[idx]}"
+                f"    Δt={dt:2d}  ω̂={entry['omega_hat']:.4f}  "
+                f"ω^safe={ws:.4f}  n={entry['n']}"
             )
         return "\n".join(lines)
 
@@ -113,25 +162,22 @@ class OverlapTable:
 #  MAX-WEIGHT FOREST  (Kounias–Hunter)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def max_weight_forest(N, K, safe_omegas):
+def max_weight_forest(N, edge_weights):
     """
     Select a maximum-weight forest over lag-truncated edges using Kruskal's.
 
-    For horizon {1,…,N} and max lag K, candidate edges are
-        E_K = {(s,t) : 1 ≤ s < t ≤ N, t−s ≤ K}
-    with weight ω^safe_{s,t}.
+    For horizon {1,…,N}, candidate edges are any (s,t) pairs present in
+    edge_weights with positive weight.
 
     Returns:
         forest:     list of (s,t) edges in the forest
         correction: total weight  Σ_{(s,t)∈F} ω^safe
     """
-    # Build candidate edges
-    edges = []
-    for s in range(1, N + 1):
-        for t in range(s + 1, min(s + K + 1, N + 1)):
-            w = safe_omegas.get(t - s, 0.0)
-            if w > 0:
-                edges.append((w, s, t))
+    edges = [
+        (w, s, t)
+        for (s, t), w in edge_weights.items()
+        if 1 <= s < t <= N and w > 0
+    ]
 
     edges.sort(reverse=True)  # greedy: heaviest first
 
@@ -199,7 +245,8 @@ class TrajectoryAlpacaDtACI:
                  force_zero_mean=False,
                  delta_conf=0.05,
                  eta_joint=0.01,
-                 base_matrix_mode="sigma_T"):
+                 base_matrix_mode="sigma_T",
+                 overlap_mode="safe"):
         """
         Args (new in v2):
             N:          MPC horizon length
@@ -225,6 +272,7 @@ class TrajectoryAlpacaDtACI:
         self.force_zero_mean = force_zero_mean
         self.eta_joint = eta_joint
         self.base_matrix_mode = base_matrix_mode
+        self.overlap_mode = overlap_mode
 
         # ── Overlap table (§6) ──
         self.overlap_table = OverlapTable(self.K, delta_conf=delta_conf)
@@ -247,6 +295,195 @@ class TrajectoryAlpacaDtACI:
         # ALPaCA (lazy init)
         self.alpaca_model = None
         self.alpaca_config = None
+        self.history_buffer = deque()
+        self.trajectory_buffer = deque()
+
+    def _scalar_multiplier(self, alpha_val):
+        """Return the scalar c used to scale the planned base ellipsoid."""
+        if self.base_matrix_mode == "alpaca_1alpha":
+            return self.scale_t
+        return self.scale_t * chi2.ppf(1 - alpha_val, df=self.d)
+
+    def _build_edge_weights(self, horizon_len, alpha_guess):
+        """Query overlap weights on the current warm-start plan."""
+        if self.K <= 0 or horizon_len <= 1:
+            return {}
+
+        c_guess = self._scalar_multiplier(alpha_guess)
+        edge_weights = {}
+        for s in range(1, horizon_len + 1):
+            for t in range(s + 1, min(horizon_len, s + self.K) + 1):
+                delta_t = t - s
+                edge_weights[(s, t)] = self.overlap_table.get_omega(
+                    c_guess,
+                    c_guess,
+                    delta_t,
+                    alpha_guess,
+                    alpha_guess,
+                    mode=self.overlap_mode,
+                )
+        return edge_weights
+
+    def _plan_horizon(self, errors, t_start, sigma_T, alpha_m):
+        """Build the planned horizon ellipsoids from the information available at t_start."""
+        T = len(errors)
+        horizon_len = min(self.N, T - t_start)
+        if horizon_len <= 0:
+            return []
+
+        d = self.d
+        ctx_hist = errors[max(0, t_start - self.n_context):t_start].copy()
+        pred_context = [row.copy() for row in ctx_hist]
+        plans = []
+        shared_sigma_opt = None
+
+        for h in range(horizon_len):
+            if len(pred_context) >= self.n_context:
+                ctx = np.array(pred_context[-self.n_context:])
+                mu_pred, sig_alpaca = self._alpaca_predict(ctx)
+            else:
+                ctx = np.array(pred_context[-self.n_context:]) if len(pred_context) > 0 else np.zeros((0, d))
+                mu_pred = np.zeros(d)
+                sig_alpaca = np.eye(d)
+
+            if self.base_matrix_mode == "sigma_T":
+                base_anchor = sigma_T
+            elif self.base_matrix_mode == "alpaca_1sd":
+                base_anchor = sig_alpaca.copy()
+            elif self.base_matrix_mode == "alpaca_1alpha":
+                chi2_scale_base = chi2.ppf(1 - alpha_m, df=d)
+                base_anchor = chi2_scale_base * sig_alpaca.copy()
+            else:
+                base_anchor = sigma_T
+
+            if shared_sigma_opt is None:
+                try:
+                    residuals = (ctx - mu_pred) if ctx.shape[0] > 0 else np.zeros((0, d))
+                    shared_sigma_opt = optimize_sigma(
+                        base_anchor,
+                        self.lam,
+                        d,
+                        alpha_m,
+                        residuals,
+                        prob_method=self.prob_method,
+                        prob_weight=self.prob_weight,
+                    )
+                except Exception:
+                    shared_sigma_opt = base_anchor.copy()
+            sigma_opt = shared_sigma_opt.copy()
+
+            if self.base_matrix_mode == "alpaca_1alpha":
+                c_scalar = self.scale_t
+                final_sigma = c_scalar * sigma_opt
+            else:
+                c_scalar = self.scale_t * chi2.ppf(1 - alpha_m, df=d)
+                final_sigma = c_scalar * sigma_opt
+
+            plans.append({
+                "h": h + 1,
+                "abs_time": t_start + h,
+                "mu_pred": mu_pred.copy(),
+                "sigma_opt": sigma_opt.copy(),
+                "final_sigma": final_sigma.copy(),
+                "alpha": alpha_m,
+                "c_scalar": c_scalar,
+                "scale_t": self.scale_t,
+            })
+
+            pred_context.append(mu_pred.copy())
+
+        return plans
+
+    def _push_planned_records(self, plan_time, horizon_plans):
+        """Store planned pair events and trajectory records until their observations resolve."""
+        horizon_len = len(horizon_plans)
+        if horizon_len == 0:
+            return
+
+        if self.K > 0:
+            for i in range(horizon_len):
+                step_s = horizon_plans[i]
+                for j in range(i + 1, min(horizon_len, i + self.K + 1)):
+                    step_t = horizon_plans[j]
+                    self.history_buffer.append({
+                        "plan_time": plan_time,
+                        "s": step_s["h"],
+                        "t": step_t["h"],
+                        "abs_s": step_s["abs_time"],
+                        "abs_t": step_t["abs_time"],
+                        "c_s": step_s["c_scalar"],
+                        "c_t": step_t["c_scalar"],
+                        "alpha_s": step_s["alpha"],
+                        "alpha_t": step_t["alpha"],
+                        "mu_s": step_s["mu_pred"].copy(),
+                        "mu_t": step_t["mu_pred"].copy(),
+                        "Sigma_s": step_s["final_sigma"].copy(),
+                        "Sigma_t": step_t["final_sigma"].copy(),
+                    })
+
+        self.trajectory_buffer.append({
+            "plan_time": plan_time,
+            "final_abs": horizon_plans[-1]["abs_time"],
+            "steps": [{
+                "abs_time": step["abs_time"],
+                "mu_pred": step["mu_pred"].copy(),
+                "final_sigma": step["final_sigma"].copy(),
+            } for step in horizon_plans],
+        })
+
+    def _resolve_overlap_records(self, errors, t_now):
+        """Resolve all buffered overlap samples whose second timestamp is now observable."""
+        unresolved = deque()
+        while self.history_buffer:
+            record = self.history_buffer.popleft()
+            if record["abs_t"] > t_now:
+                unresolved.append(record)
+                continue
+
+            eps_s = errors[record["abs_s"]] - record["mu_s"]
+            eps_t = errors[record["abs_t"]] - record["mu_t"]
+            try:
+                V_s = float(eps_s @ np.linalg.solve(record["Sigma_s"], eps_s) >= 1.0)
+            except np.linalg.LinAlgError:
+                V_s = 1.0
+            try:
+                V_t = float(eps_t @ np.linalg.solve(record["Sigma_t"], eps_t) >= 1.0)
+            except np.linalg.LinAlgError:
+                V_t = 1.0
+
+            self.overlap_table.update(
+                record["c_s"],
+                record["c_t"],
+                record["t"] - record["s"],
+                record["alpha_s"],
+                record["alpha_t"],
+                V_s * V_t,
+            )
+        self.history_buffer = unresolved
+
+    def _resolve_trajectory_records(self, errors, t_now):
+        """Resolve any full planned trajectories that have completely materialized."""
+        resolved = []
+        unresolved = deque()
+        while self.trajectory_buffer:
+            record = self.trajectory_buffer.popleft()
+            if record["final_abs"] > t_now:
+                unresolved.append(record)
+                continue
+
+            traj_violation = 0.0
+            for step in record["steps"]:
+                residual = errors[step["abs_time"]] - step["mu_pred"]
+                try:
+                    missed = float(
+                        residual @ np.linalg.solve(step["final_sigma"], residual) >= 1.0
+                    )
+                except np.linalg.LinAlgError:
+                    missed = 1.0
+                traj_violation = max(traj_violation, missed)
+            resolved.append((record["plan_time"], traj_violation))
+        self.trajectory_buffer = unresolved
+        return resolved
 
     # ------------------------------------------------------------------
     #  ALPaCA helpers (reuse v1 logic)
@@ -305,7 +542,9 @@ class TrajectoryAlpacaDtACI:
 
         Returns the same dict keys as v1 plus:
             alpha_m_seq:           per-step allocated α_m
+            alpha_horizon_seq:     per-horizon α allocation at each step
             alpha_joint_live_seq:  trajectory budget over time
+            alpha_total_seq:       sum of horizon α after overlap subtraction
             correction_seq:        forest correction at each step
             traj_violation_seq:    per-window trajectory violation
         """
@@ -334,7 +573,9 @@ class TrajectoryAlpacaDtACI:
         # ── Output storage ──
         coverage_seq = np.zeros(T)
         alpha_m_seq = np.zeros(T)
+        alpha_horizon_seq = np.zeros((T, self.N))
         alpha_joint_live_seq = np.zeros(T)
+        alpha_total_seq = np.zeros(T)
         correction_seq = np.zeros(T)
         scale_seq = np.zeros(T)
         volume_seq = np.zeros(T)
@@ -344,6 +585,7 @@ class TrajectoryAlpacaDtACI:
         sigma_opt_seq = [None] * T
         violation_seq = np.zeros(T)       # V_t per step
         traj_violation_seq = np.zeros(T)   # per-window trajectory indicator
+        overlap_mode_seq = [self.overlap_mode] * T
 
         # ── Main loop ──
         for t in range(T):
@@ -351,61 +593,33 @@ class TrajectoryAlpacaDtACI:
             sigma_T = self.sigma_ctrl.value
             sigma_T_seq[t] = sigma_T.copy()
 
-            # 1) ALPaCA prediction
-            if t >= self.n_context:
-                ctx = errors[max(0, t - self.n_context):t]
-                mu_pred, sig_alpaca = self._alpaca_predict(ctx)
-            else:
-                mu_pred = np.zeros(d)
-                sig_alpaca = np.eye(d)
-            mu_pred_seq[t] = mu_pred
-
-            # 2) Query overlap table → forest correction
-            safe_omegas = self.overlap_table.get_all_safe()
-            _, correction = max_weight_forest(self.N, self.K, safe_omegas)
+            # 1) Query overlap table on a frozen warm-start plan
+            horizon_len = min(self.N, T - t)
+            alpha_guess = np.clip(self.alpha_joint_live / max(1, horizon_len), 0.001, 0.5)
+            edge_weights = self._build_edge_weights(horizon_len, alpha_guess)
+            _, correction = max_weight_forest(horizon_len, edge_weights)
             correction_seq[t] = correction
 
-            # 3) Compute per-step α_m using joint target formula (Eq. 11)
-            alpha_m = (self.alpha_joint_live + correction) / self.N
+            # 2) Compute per-step α_m using the joint target formula
+            alpha_m = (self.alpha_joint_live + correction) / max(1, horizon_len)
             alpha_m = np.clip(alpha_m, 0.001, 0.5)
             alpha_m_seq[t] = alpha_m
+            alpha_horizon_seq[t, :] = alpha_m
             alpha_joint_live_seq[t] = self.alpha_joint_live
+            alpha_total_seq[t] = horizon_len * alpha_m - correction
 
-            # 4) Compute Base Matrix and Optimize Σ
-            if self.base_matrix_mode == "sigma_T":
-                base_anchor = sigma_T
-            elif self.base_matrix_mode == "alpaca_1sd":
-                # Strategy 1: ALPaCA provides the 1-SD base shape
-                base_anchor = sig_alpaca.copy()
-            elif self.base_matrix_mode == "alpaca_1alpha":
-                # Strategy 2: ALPaCA 1-alpha ellipsoid IS the base shape
-                chi2_scale_base = chi2.ppf(1 - alpha_m, df=d)
-                base_anchor = chi2_scale_base * sig_alpaca.copy()
-            else:
-                base_anchor = sigma_T
-
-            try:
-                residuals = (ctx - mu_pred) if t >= self.n_context \
-                    else np.zeros((0, d))
-                sigma_opt = optimize_sigma(
-                    base_anchor, self.lam, d, alpha_m, residuals,
-                    prob_method=self.prob_method,
-                    prob_weight=self.prob_weight,
-                )
-            except Exception:
-                sigma_opt = base_anchor.copy()
-                
+            # 3) Build the horizon plan from the information available at t
+            horizon_plans = self._plan_horizon(errors, t, sigma_T, alpha_m)
+            if len(horizon_plans) == 0:
+                continue
+            current_plan = horizon_plans[0]
+            mu_pred = current_plan["mu_pred"]
+            sigma_opt = current_plan["sigma_opt"]
+            final_sigma = current_plan["final_sigma"]
+            mu_pred_seq[t] = mu_pred
             sigma_opt_seq[t] = sigma_opt.copy()
 
-            # 5) Final ellipsoid
-            if self.base_matrix_mode == "alpaca_1alpha":
-                # The chi2 scale was already baked into the base shape
-                final_sigma = self.scale_t * sigma_opt
-            else:
-                chi2_scale = chi2.ppf(1 - alpha_m, df=d)
-                final_sigma = self.scale_t * chi2_scale * sigma_opt
-
-            # 6) Coverage check
+            # 4) Coverage check for the first planned step
             residual_t = eps - mu_pred
             try:
                 mahal = residual_t @ np.linalg.solve(final_sigma, residual_t)
@@ -420,24 +634,18 @@ class TrajectoryAlpacaDtACI:
             volume_seq[t] = max(np.linalg.det(final_sigma), 1e-12)
             scale_seq[t] = self.scale_t
 
-            # 7) Update overlap table (§6): for each lag Δ ∈ {1,…,K}
-            for delta in range(1, min(self.K + 1, t + 1)):
-                Y = violation_seq[t - delta] * violation_seq[t]
-                self.overlap_table.update(delta, Y)
+            # 5) Store original planned sets, then resolve any completed records
+            self._push_planned_records(t, horizon_plans)
+            self._resolve_overlap_records(errors, t)
+            resolved_trajs = self._resolve_trajectory_records(errors, t)
 
-            # 8) PID update on budget using trajectory-level errors (§8)
-            # Evaluate trajectory violation E_k for the window ending at t
-            if (t + 1) % self.N == 0 and t >= self.N - 1:
-                window_start = t - self.N + 1
-                window_violations = violation_seq[window_start:t + 1]
-                E_k = float(np.any(window_violations > 0))
-                traj_violation_seq[t] = E_k
-                
-                # PID tracks the joint target
+            # 6) PID update on resolved trajectory-level errors (§8)
+            if len(resolved_trajs) > 0:
+                plan_idx, E_k = resolved_trajs[-1]
+                traj_violation_seq[plan_idx] = E_k
                 err_traj = self.alpha_target - E_k
                 self.integrator_sum += err_traj
                 self.integrator_sum = saturation_fn(self.integrator_sum, t, self.C_sat)
-                
                 P_term = self.eta_joint * err_traj
                 I_term = self.K_I * self.eta_joint * self.integrator_sum
                 new_budget = self.alpha_joint_live + P_term + I_term
@@ -448,7 +656,7 @@ class TrajectoryAlpacaDtACI:
                 new_budget = self.alpha_target
             self.alpha_joint_live = np.clip(new_budget, 0.001, 0.999)
 
-            # 9) Update Σ_T expert pool & scale (shared with v1)
+            # 7) Update Σ_T expert pool & scale (shared with v1)
             chi2_scale_for_update = chi2.ppf(1 - alpha_m, df=d)
             self.sigma_ctrl.update(residual_t, err_t,
                                    self.scale_t * chi2_scale_for_update,
@@ -470,7 +678,9 @@ class TrajectoryAlpacaDtACI:
         results = {
             "coverage_seq": coverage_seq,
             "alpha_seq": alpha_m_seq,        # per-step allocated α
+            "alpha_horizon_seq": alpha_horizon_seq,
             "alpha_joint_live_seq": alpha_joint_live_seq,
+            "alpha_total_seq": alpha_total_seq,
             "correction_seq": correction_seq,
             "scale_seq": scale_seq,
             "volume_seq": volume_seq,
@@ -480,6 +690,9 @@ class TrajectoryAlpacaDtACI:
             "sigma_opt_seq": sigma_opt_seq,
             "violation_seq": violation_seq,
             "traj_violation_seq": traj_violation_seq,
+            "overlap_mode_seq": overlap_mode_seq,
+            "N": self.N,
+            "K": self.K,
         }
 
         if verbose:
