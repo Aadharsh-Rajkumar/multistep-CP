@@ -451,10 +451,11 @@ class TrajectoryAlpacaDtACI:
             # 9) Update Σ_T expert pool & scale (shared with v1)
             chi2_scale_for_update = chi2.ppf(1 - alpha_m, df=d)
             self.sigma_ctrl.update(residual_t, err_t,
-                                   self.scale_t * chi2_scale_for_update)
+                                   self.scale_t * chi2_scale_for_update,
+                                   target=alpha_m)
 
             new_scale = (self.scale_t
-                         + self.scale_gamma * (err_t - self.alpha_target))
+                         + self.scale_gamma * (err_t - alpha_m))
             if np.isnan(new_scale) or np.isinf(new_scale):
                 new_scale = 1.0
             self.scale_t = np.clip(new_scale, 0.1, 50.0)

@@ -220,11 +220,12 @@ class DtACISigmaPool:
         """Current shape Σ_T from the selected expert."""
         return self.expert_sigmas[self.cur_expert].copy()
 
-    def update(self, eps, err_t, scale_factor):
+    def update(self, eps, err_t, scale_factor, target=0.1):
         """
         Update all experts' Σ after observing error vector eps.
         err_t: 1 if point was outside ellipsoid, 0 if inside.
         scale_factor: current scale (s_t * chi2 quantile) for loss evaluation.
+        target: the active step-level miscoverage target (alpha_t in v1, alpha_m in v2).
         """
         sigma_before = self.value
         outer = np.outer(eps, eps)
@@ -232,7 +233,6 @@ class DtACISigmaPool:
 
         # Compute per-expert coverage loss
         expert_losses = np.zeros(self.K)
-        target = 0.1  # will be overridden from outside; placeholder
         for j in range(self.K):
             # Check coverage with this expert's Sigma
             try:
@@ -560,7 +560,8 @@ class IntegratedAlpacaDtACI:
                  replay_buffer_size=0,
                  prob_method="empirical",
                  prob_weight=10.0,
-                 force_zero_mean=False):
+                 force_zero_mean=False,
+                 base_matrix_mode="sigma_T"):
         """
         d: dimensionality of the time series
         alpha_target: target expected error rate (e.g., 0.1 for 90% coverage)
@@ -587,6 +588,7 @@ class IntegratedAlpacaDtACI:
         self.prob_method = prob_method
         self.prob_weight = prob_weight
         self.force_zero_mean = force_zero_mean
+        self.base_matrix_mode = base_matrix_mode
 
         self.gammas = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
 
@@ -760,12 +762,17 @@ class IntegratedAlpacaDtACI:
                 sig_alpaca = np.eye(d)
                 mu_pred_seq[t] = mu_pred
 
-            # 2) Optimize Σ:
+            # 2) Compute Base Matrix and Optimize Σ
+            if self.base_matrix_mode == "alpaca_1sd":
+                base_anchor = sig_alpaca.copy()
+            else:
+                base_anchor = sigma_T
+
             try:
                 recent_residuals = ctx - mu_pred if t >= self.n_context else np.zeros((0, d))
-                sigma_opt = optimize_sigma(sigma_T, self.lam, d, alpha_t, recent_residuals, prob_method=self.prob_method, prob_weight=self.prob_weight)
+                sigma_opt = optimize_sigma(base_anchor, self.lam, d, alpha_t, recent_residuals, prob_method=self.prob_method, prob_weight=self.prob_weight)
             except Exception:
-                sigma_opt = sigma_T.copy()
+                sigma_opt = base_anchor.copy()
             sigma_opt_seq[t] = sigma_opt.copy()
 
             # 3) Ghost Replay Buffer
@@ -844,7 +851,8 @@ class IntegratedAlpacaDtACI:
             self.alpha_t = np.clip(new_alpha, 0.001, 0.999)
 
             #    Σ_T: DtACI expert pool (shape adaptation uses residual variance)
-            self.sigma_ctrl.update(residual_t, err_t, scale_b * chi2_scale)
+            self.sigma_ctrl.update(residual_t, err_t, scale_b * chi2_scale,
+                                   target=self.alpha_t)
 
             #    s_t: scalar update with NaN guard
             new_scale = self.scale_t + self.scale_gamma * (err_t - self.alpha_target)

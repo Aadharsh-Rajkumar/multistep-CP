@@ -164,73 +164,122 @@ def plot_comparison(
     plt.close()
 
     # ─────────────────────────────────────────────
-    # 5. Ellipsoid snapshots  (side-by-side at select timesteps)
+    # 5. Ellipsoid snapshots (CHUNKED OUTPUT)
     # ─────────────────────────────────────────────
-    # Granular snapshots for both DTACI and ALPaCA comparisons
-    snapshot_times = list(range(900, 950, 5))
-    snapshot_times = [t for t in snapshot_times if 0 <= t < T]
+
+    import math
+
+    start_t, end_t = 900, 1900
+    step = 5
+    chunk_size = 50  # each PNG spans 50 timesteps
+
+    all_times = list(range(start_t, end_t, step))
+    all_times = [t for t in all_times if 0 <= t < T]
 
     warmup_pts = max(50, min(100, T // 4))
 
-    fig, axes = plt.subplots(3, len(snapshot_times),
-                             figsize=(5 * len(snapshot_times), 15))
-    if len(snapshot_times) == 1:
-        axes = axes.reshape(3, 1)
+    chunks = [
+        all_times[i:i + chunk_size // step]
+        for i in range(0, len(all_times), chunk_size // step)
+    ]
 
-    for col, t in enumerate(snapshot_times):
-        for row, (res, label, color) in enumerate([
-            (r1, "v1 (Marginal)", c_v1),
-            (r2, label2, c_v2),
-            (r2b, label2b, c_v2b),
-        ]):
-            ax = axes[row, col]
+    ell_dir = os.path.join(output_dir, "cmp_ellipsoids")
+    os.makedirs(ell_dir, exist_ok=True)
 
-            recent = tracking_errors[max(0, t - 30):t + 1]
-            if "Stock" in title_prefix:
-                ax.scatter(recent[:, 0], recent[:, 1], color="gray", alpha=0.4, s=15)
-            else:
-                ax.plot(recent[:, 0], recent[:, 1], color="gray", alpha=0.4, lw=1)
-            
-            ax.scatter(tracking_errors[t, 0], tracking_errors[t, 1],
-                       color="black", s=50, zorder=4)
+    for chunk_idx, snapshot_times in enumerate(chunks):
 
-            sigma_opt = res["sigma_opt_seq"][t]
-            mu = res["mu_pred_seq"][t]
-            if sigma_opt is not None:
-                alpha_val = res["alpha_seq"][t]
-                s = res["scale_seq"][t]
-                chi2_s = chi2.ppf(1 - np.clip(alpha_val, 0.001, 0.999),
-                                  df=tracking_errors.shape[1])
-                final = s * chi2_s * sigma_opt
-                plot_ellipse_pts(ax, mu, final, color=color, alpha=0.25)
+        if len(snapshot_times) == 0:
+            continue
 
-                vol = max(np.linalg.det(final), 1e-12)
-                ax.set_xlabel(f"Vol = {vol:.4e}", fontsize=9)
+        fig, axes = plt.subplots(
+            3, len(snapshot_times),
+            figsize=(2.2 * len(snapshot_times), 12)
+        )
 
-            ax.set_title(f"{label}  t={t}", fontsize=10)
-            pad = 0.1
-            if sigma_opt is not None:
-                rx = np.sqrt(final[0, 0])
-                ry = np.sqrt(final[1, 1])
-                min_x = min(recent[:, 0].min(), mu[0] - rx)
-                max_x = max(recent[:, 0].max(), mu[0] + rx)
-                min_y = min(recent[:, 1].min(), mu[1] - ry)
-                max_y = max(recent[:, 1].max(), mu[1] + ry)
-            else:
-                min_x, max_x = recent[:, 0].min(), recent[:, 0].max()
-                min_y, max_y = recent[:, 1].min(), recent[:, 1].max()
-            
-            ax.set_xlim(min_x - pad, max_x + pad)
-            ax.set_ylim(min_y - pad, max_y + pad)
-            ax.set_aspect("equal")
-            ax.grid(True, alpha=0.2)
+        if len(snapshot_times) == 1:
+            axes = axes.reshape(3, 1)
 
-    fig.suptitle(f"{title_prefix}: Ellipsoid Snapshots {title_extra}",
-                 fontsize=14, y=1.01)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "cmp_ellipsoids.png"),
-                dpi=150, bbox_inches="tight")
-    plt.close()
+        for col, t in enumerate(snapshot_times):
+
+            for row, (res, label, color) in enumerate([
+                (r1, "v1 (Marginal)", c_v1),
+                (r2, label2, c_v2),
+                (r2b, label2b, c_v2b),
+            ]):
+
+                ax = axes[row, col]
+
+                recent = tracking_errors[max(0, t - 30):t + 1]
+
+                if recent.shape[0] > 0:
+                    if "Stock" in title_prefix:
+                        ax.scatter(recent[:, 0], recent[:, 1],
+                                   color="gray", alpha=0.4, s=10)
+                    else:
+                        ax.plot(recent[:, 0], recent[:, 1],
+                                color="gray", alpha=0.4, lw=1)
+
+                ax.scatter(
+                    tracking_errors[t, 0],
+                    tracking_errors[t, 1],
+                    color="black",
+                    s=40,
+                    zorder=5
+                )
+
+                sigma_opt = res["sigma_opt_seq"][t]
+                mu = res["mu_pred_seq"][t]
+
+                if sigma_opt is not None:
+                    alpha_val = res["alpha_seq"][t]
+                    s = res["scale_seq"][t]
+
+                    chi2_s = chi2.ppf(
+                        1 - np.clip(alpha_val, 0.001, 0.999),
+                        df=tracking_errors.shape[1]
+                    )
+
+                    final = s * chi2_s * sigma_opt
+                    plot_ellipse_pts(ax, mu, final, color=color, alpha=0.25)
+
+                    vol = max(np.linalg.det(final), 1e-12)
+                    ax.set_xlabel(f"{vol:.2e}", fontsize=8)
+
+                ax.set_title(f"{label} t={t}", fontsize=9)
+
+                # auto bounds
+                pad = 0.1
+                if sigma_opt is not None:
+                    rx = np.sqrt(final[0, 0])
+                    ry = np.sqrt(final[1, 1])
+
+                    min_x = min(recent[:, 0].min(), mu[0] - rx)
+                    max_x = max(recent[:, 0].max(), mu[0] + rx)
+                    min_y = min(recent[:, 1].min(), mu[1] - ry)
+                    max_y = max(recent[:, 1].max(), mu[1] + ry)
+                else:
+                    min_x, max_x = recent[:, 0].min(), recent[:, 0].max()
+                    min_y, max_y = recent[:, 1].min(), recent[:, 1].max()
+
+                ax.set_xlim(min_x - pad, max_x + pad)
+                ax.set_ylim(min_y - pad, max_y + pad)
+                ax.set_aspect("equal")
+                ax.grid(True, alpha=0.2)
+
+        fig.suptitle(
+            f"{title_prefix}: Ellipsoids {snapshot_times[0]}–{snapshot_times[-1]}",
+            fontsize=14
+        )
+
+        plt.tight_layout()
+
+        out_path = os.path.join(
+            ell_dir,
+            f"ellipsoids_{snapshot_times[0]}_{snapshot_times[-1]}.png"
+        )
+
+        plt.savefig(out_path, dpi=250, bbox_inches="tight")
+        plt.close()
 
     # ─────────────────────────────────────────────
     # 6. Correction size (v2 only)
@@ -307,9 +356,12 @@ def run_robotics_comparison(mode="dtaci"):
 
     # ── v1 ──
     print("  Running v1 (per-step DtACI) …")
+    kwargs_v1 = shared_kwargs.copy()
+    kwargs_v1["alpha_target"] = shared_kwargs["alpha_target"] / 10.0
     sys_v1 = IntegratedAlpacaDtACI(
         replay_buffer_size=0,
-        **shared_kwargs,
+        base_matrix_mode="alpaca_1sd",
+        **kwargs_v1,
     )
     r1 = sys_v1.run(tracking_errors, verbose=True)
 
@@ -339,26 +391,26 @@ def run_robotics_comparison(mode="dtaci"):
         r2b = sys_v2b.run(tracking_errors, verbose=True)
     else:
         # ── v2 (Joint PID + Overlap) ──
-        print("\n  Running v2 (Joint + Overlap, sigma_T base) …")
+        print("\n  Running v2 (Joint + Overlap, ALPaCA 1-SD base) …")
         kwargs_v2a = shared_kwargs.copy()
         kwargs_v2a["lam"] = 0.5
         kwargs_v2a["scale_gamma"] = 0.01
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
-            base_matrix_mode="sigma_T",
+            base_matrix_mode="alpaca_1sd",
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(tracking_errors, verbose=True)
 
         # ── v2_bonf (Static Bonferroni + Overlap) ──
-        print("\n  Running v2_bonf (Joint Bonferroni, sigma_T base, NO overlap) …")
+        print("\n  Running v2_bonf (Joint Bonferroni, ALPaCA 1-SD base, NO overlap) …")
         kwargs_v2b = shared_kwargs.copy()
         kwargs_v2b["lam"] = 0.5
         kwargs_v2b["scale_gamma"] = 0.01
         # Set eta_joint=0.0 to disable PID (Static)
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=0, delta_conf=0.05, eta_joint=0.01,
-            base_matrix_mode="sigma_T",
+            base_matrix_mode="alpaca_1sd",
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(tracking_errors, verbose=True)
@@ -401,9 +453,12 @@ def run_stocks_comparison(mode="dtaci"):
     )
 
     print("  Running v1 (per-step DtACI) …")
+    kwargs_v1 = shared_kwargs.copy()
+    kwargs_v1["alpha_target"] = shared_kwargs["alpha_target"] / 10.0
     sys_v1 = IntegratedAlpacaDtACI(
         replay_buffer_size=0,
-        **shared_kwargs,
+        base_matrix_mode="alpaca_1sd",
+        **kwargs_v1,
     )
     r1 = sys_v1.run(errors, verbose=True)
 
@@ -430,24 +485,24 @@ def run_stocks_comparison(mode="dtaci"):
         )
         r2b = sys_v2b.run(errors, verbose=True)
     else:
-        print("\n  Running v2 (Joint + Overlap, sigma_T base) …")
+        print("\n  Running v2 (Joint + Overlap, ALPaCA 1-SD base) …")
         kwargs_v2a = shared_kwargs.copy()
         kwargs_v2a["lam"] = 0.5
         kwargs_v2a["scale_gamma"] = 0.01
         sys_v2a = TrajectoryAlpacaDtACI(
             N=10, K=5, delta_conf=0.05, eta_joint=0.01,
-            base_matrix_mode="sigma_T",
+            base_matrix_mode="alpaca_1sd",
             **kwargs_v2a,
         )
         r2 = sys_v2a.run(errors, verbose=True)
 
-        print("\n  Running v2_bonf (Joint Bonferroni, sigma_T base, NO overlap) …")
+        print("\n  Running v2_bonf (Joint Bonferroni, ALPaCA 1-SD base, NO overlap) …")
         kwargs_v2b = shared_kwargs.copy()
         kwargs_v2b["lam"] = 0.5
         kwargs_v2b["scale_gamma"] = 0.01
         sys_v2b = TrajectoryAlpacaDtACI(
             N=10, K=0, delta_conf=0.05, eta_joint=0.01,
-            base_matrix_mode="sigma_T",
+            base_matrix_mode="alpaca_1sd",
             **kwargs_v2b,
         )
         r2b = sys_v2b.run(errors, verbose=True)
