@@ -246,7 +246,8 @@ class TrajectoryAlpacaDtACI:
                  delta_conf=0.05,
                  eta_joint=0.01,
                  base_matrix_mode="sigma_T",
-                 overlap_mode="safe"):
+                 overlap_mode="safe",
+                 skip_alpaca_init=False):
         """
         Args (new in v2):
             N:          MPC horizon length
@@ -273,6 +274,9 @@ class TrajectoryAlpacaDtACI:
         self.eta_joint = eta_joint
         self.base_matrix_mode = base_matrix_mode
         self.overlap_mode = overlap_mode
+        # Whether to skip ALPaCA training because a pre-trained
+        # ALPaCA model will be injected before run() is called.
+        self.skip_alpaca_init = skip_alpaca_init
 
         # ── Overlap table (§6) ──
         self.overlap_table = OverlapTable(self.K, delta_conf=delta_conf)
@@ -565,10 +569,15 @@ class TrajectoryAlpacaDtACI:
             sigma_mix=1 / 1000, eta=2.72,
         )
 
-        try:
-            self._init_alpaca(warmup_errors)
-        except Exception as e:
-            print(f"  [v2] ALPaCA init failed: {e}. Continuing without.")
+        # Only train ALPaCA if a pre-trained model was not injected.
+        if not getattr(self, "skip_alpaca_init", False):
+            try:
+                self._init_alpaca(warmup_errors)
+            except Exception as e:
+                print(
+                    f"  [v2] ALPaCA init failed: "
+                    f"{e}. Continuing without."
+                )
 
         # ── Output storage ──
         coverage_seq = np.zeros(T)
